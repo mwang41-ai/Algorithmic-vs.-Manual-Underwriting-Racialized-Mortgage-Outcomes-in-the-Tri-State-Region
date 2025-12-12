@@ -1,0 +1,491 @@
+#load libraries
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(sf)
+library(tigris)
+library(patchwork)
+
+#load data
+ny <- read.csv("state_NY.csv")
+nj <- read.csv("state_NJ.csv")
+ct <- read.csv("state_CT.csv")
+
+#tri-state data
+hmda <- bind_rows(ny, nj, ct)
+
+#query data
+ls(hmda)
+nrow(hmda)
+
+
+#create urm variable
+hmda <- hmda %>%
+  mutate(
+    urm = case_when(
+      applicant_race.1 %in% c("1", "3", "4") ~ 1, #AIAN, Black, NHPI
+      applicant_ethnicity.1 == "1" ~ 1, #Hispanic or Latino
+      TRUE ~ 0 #White, Asian, etc
+    )
+  ) 
+
+
+#create aus_used: "1" = algorithm, "0" = no algorithm
+hmda <- hmda %>%
+  mutate(
+    aus_used = case_when(
+      is.na(aus.1) ~ 0, #blank
+      aus.1 == "" ~ 0, #missing,
+      aus.1 == "1111" ~ 0, #no aus used
+      TRUE ~ 1
+    )
+  )
+
+
+#create a urm denial variable 
+hmda <- hmda %>%
+  mutate(
+    denied = ifelse(action_taken == "3", 1, 0) # 3 was coded for denied. 
+  )
+
+hmda <- hmda %>%
+  mutate(
+    urm_denied = ifelse(urm == 1 & denied == 1, 1, 0)
+  )
+
+table(hmda$urm_denied)
+
+
+#lender-level data
+lender_urm <- hmda %>%
+  filter(!is.na(lei)) %>%  #loans without an LEI are removed
+  group_by(lei) %>%  #group loans by lender
+  summarise(
+  total_loans = n(),
+  aus_loans = sum(aus_used == 1),
+  urm_loans = sum(urm == 1),
+  urm_denials = sum(urm_denied == 1),
+  .groups = "drop"
+) %>%
+  mutate(
+    aus_adoption = aus_loans / total_loans, #create aus variable
+    urm_denial_rate = if_else(
+      urm_loans > 0,
+      urm_denials / urm_loans,
+      NA_real_
+    )
+  )
+
+#filter to lenders with at least 25 URM loans
+lender_urm_filtered <- lender_urm %>%
+  filter(urm_loans >= 25)
+
+#correlation between aus penetration and urm denial rate
+cor.test(lender_urm_filtered$aus_adoption, lender_urm_filtered$urm_denial_rate)
+
+#linear regression
+model <- lm(urm_denial_rate ~ aus_adoption,
+            data = lender_urm_filtered)
+
+summary(model)
+
+
+# Create AUS usage groups at lender level
+lender_urm_groups <- lender_urm_filtered %>%
+  mutate(
+    aus_group = case_when(
+      aus_adoption == 0 ~ "manual_only",
+      aus_adoption > 0 ~ "AUS"
+    )
+  )
+
+# Mean URM denial rate by AUS group
+group_summary <- lender_urm_groups %>%
+  group_by(aus_group) %>%
+  summarise(
+    n_lenders       = n(),
+    mean_urm_denial = mean(urm_denial_rate, na.rm = TRUE),
+    sd_urm_denial   = sd(urm_denial_rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+group_summary   
+
+# t-test: manual-only vs AUS lenders
+manual  <- lender_urm_groups %>%
+  filter(aus_group == "manual_only") %>%
+  pull(urm_denial_rate)
+
+aus <- lender_urm_groups %>%
+  filter(aus_group == "AUS") %>%
+  pull(urm_denial_rate)
+
+t.test(manual, aus)
+
+
+#visualizations
+
+#sankey
+hmda_sankey <- hmda %>%
+  mutate(
+    group = if_else(urm == 1, "URM", "Non-URM"),
+    method = if_else(aus_used == 1, "AUS", "Manual")
+  )
+
+sankey_edges_stage <- hmda_sankey %>%
+  group_by(group, method) %>%
+  summarise(
+    value = n(),
+    denial_rate = mean(denied == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    source = group,
+    target = method,
+    value = value,
+    denial_rate = denial_rate
+  )
+#export sankey, import into RawGraph
+write_csv(sankey_edges_stage, "hmda_stage_sankey.csv")
+
+
+#scatterplot + regression line
+scatter <- ggplot(lender_urm_groups,
+       aes(x = aus_adoption,
+           y = urm_denial_rate,
+           color = aus_group,
+           )) +
+  geom_point(alpha = 0.7,
+             position = position_jitter(width = 0.01, height = 0)) +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              color = "black") +
+  scale_color_manual(
+    values = c(
+    "manual_only" = "#4D4D4D",
+    "AUS" = "#b2182b"
+  ),
+  labels = c(
+    "manual_only" = "Manual",
+    "AUS" = "AUS"
+   )
+  ) +
+  labs(
+    title = "AUS Adoption vs. URM Denial Rate",
+    x = "AUS Adoption (0-1)",
+    y = "Denial Rate",
+    color = "Lender Type", #legend title
+  ) +
+  theme_minimal(base_family = "Times New Roman") +
+  theme(
+    plot.background = element_rect(fill = "#F6F0E6", color = NA),
+    panel.grid.major = element_line(color = "#E5DFD3"),   # soft muted grid
+    panel.grid.minor = element_line(color = "#E5DFD3"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 12)
+)
+
+#bar chart
+#29.6% vs 20.6%
+barchart <- group_summary %>%
+  filter(aus_group %in% c("manual_only", "AUS")) %>%
+  ggplot(aes(x = aus_group, y = mean_urm_denial, fill = aus_group)) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  labs(
+    title = "URM Denial Rate by Underwriting Type",
+    x = "Lender Type",
+    y = "Denial Rate"
+  ) +
+  scale_fill_manual(values = c("manual_only" = "#4D4D4D", "AUS" = "#b2182b")) +
+  scale_x_discrete(labels = c("AUS" = "AUS", "manual_only" = "Manual")) +
+  theme_minimal(base_family = "Times New Roman") +
+  theme(
+    plot.background = element_rect(fill = "#F6F0E6", color = NA),
+    panel.grid.major = element_line(color = "#E5DFD3"),   # soft muted grid
+    panel.grid.minor = element_line(color = "#E5DFD3"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 12),
+    legend.position  = "none"
+  )
+
+
+#boxplot
+box_data <- lender_urm_groups %>%
+  filter(aus_group %in% c("AUS", "manual_only"))
+
+boxplot <- ggplot(box_data,
+       aes(x = aus_group,
+           y = urm_denial_rate,
+           fill = aus_group)) +
+  geom_boxplot(width = 0.5, alpha = 0.85) +
+  scale_fill_manual(values = c(
+    "AUS"    = "#B2182B",
+    "manual_only" = "#4D4D4D"
+  )) +
+  scale_x_discrete(labels = c("AUS" = "AUS", "manual_only" = "Manual")) +
+  labs(
+    title = "Distribution of URM Denial Rates by Underwriting Type",
+    x = "Lender Type",
+    y = "Denial Rate"
+  ) +
+  theme_minimal(base_family = "Times New Roman") +
+  theme(
+    plot.background  = element_rect(fill = "#F6F0E6", color = NA),
+    panel.grid.major = element_line(color = "#E5DFD3"),
+    panel.grid.minor = element_line(color = "#E5DFD3"),
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+    axis.title = element_text(hjust = 0.5, size = 14),
+    axis.text = element_text(size = 12),
+    legend.position  = "none"
+  )
+
+#make a map
+options(tigris_use_cache = TRUE)
+
+#create fips
+hmda <- hmda %>%
+  mutate(
+    county_code = as.character(county_code),
+    county_code = stringr::str_trim(county_code),
+    fips = stringr::str_pad(county_code, width = 5, pad = "0")
+  )
+
+
+lender_location <- hmda %>%
+  filter(!is.na(fips)) %>%
+  group_by(lei, state_code, county_code, fips) %>%
+  summarise(n_loans = n(), .groups = "drop") %>%
+  group_by(lei) %>%
+  slice_max(n_loans, n = 1, with_ties = FALSE) %>%  # pick top county
+  ungroup()
+
+#manual-only lenders
+manual_lenders <- lender_urm_groups %>%
+  filter(aus_group == "manual_only") %>%
+  left_join(lender_location, by = "lei")
+
+
+#get county shapes for NY-NJ-CT
+counties_tri <- counties(
+  state = c("NY", "NJ", "CT"),
+  year  = 2023,
+  cb    = TRUE,
+  class = "sf"
+) %>%
+  mutate(fips = GEOID)
+
+#get tri-state boudaries
+states_tri <- states(
+  year = 2023,
+  cb = TRUE,
+  class = "sf"
+) %>%
+  filter(STUSPS %in% c("NY", "NJ", "CT"))
+
+#aggregate manual lenders by county
+manual_by_county <- manual_lenders %>%
+  group_by(fips) %>%
+  summarise(
+    n_manual_lenders = n(),
+    avg_urm_denial   = mean(urm_denial_rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+manual_map_df <- counties_tri %>%
+  left_join(manual_by_county, by = "fips")
+
+#map of how many manual-only lenders per county
+ggplot() +
+  geom_sf(data = manual_map_df,
+    fill = "#F6F0E6", 
+    color = "grey85", 
+    size = 0.15
+    ) + #base map
+  geom_sf(
+    data = subset(manual_map_df, !is.na(n_manual_lenders)),
+    aes(fill = n_manual_lenders),
+    color = "black",
+    size = 0.15,
+    ) + #counties with manual lenders
+  geom_sf(
+    data = states_tri,
+    fill = NA,
+    color = "black", 
+    size = 0.6,
+    inherit.aes = FALSE
+    ) + #state layer
+  scale_fill_gradient(
+    low      = "#F2DCDC",   # light red
+    high     = "#B2182B",   # your dark red
+    na.value = "#F6F0E6",   # ivory for counties with 0 manual lenders
+    name     = "Manual-only\nlenders"
+  ) +
+  labs(
+    title = "Where Manual-Only Lenders Operate",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_family = "Times New Roman") +
+  theme(
+    plot.background  = element_rect(fill = "#F6F0E6", color = NA),
+    panel.background = element_rect(fill = "#F6F0E6", color = NA),
+    panel.grid = element_blank(),
+    plot.title       = element_text(size = 18, face = "bold"),
+    plot.subtitle    = element_text(size = 12)
+  )
+
+#map urm denial rates by manual-only lenders
+ggplot() +
+  geom_sf(
+    data = manual_map_df,
+    fill = "#F6F0E6",
+    color = "grey85",
+    size = 0.15
+  ) +
+  geom_sf(
+    data = subset(manual_map_df, !is.na(avg_urm_denial)),
+    aes(fill = avg_urm_denial),
+    color = "black",
+    size = 0.15
+  ) +
+  geom_sf(
+    data = states_tri,
+    fill = NA,
+    color = "black",
+    size = 0.6,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_gradient(
+    low      = "#F2DCDC",
+    high     = "#B2182B",
+    na.value = "#F6F0E6",
+    name     = "Avg. URM\ndenial rate"
+  ) +
+  labs(
+    title = "URM Denial Rates / Manual-Only",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_family = "Times New Roman") +
+  theme(
+    plot.background  = element_rect(fill = "#F6F0E6", color = NA),
+    panel.background = element_rect(fill = "#F6F0E6", color = NA),
+    panel.grid = element_blank(),
+    plot.title       = element_text(size = 18, face = "bold"),
+    plot.subtitle    = element_text(size = 12)
+  )
+
+
+# Lender-level AUS vs Manual composition by county
+lender_penetration <- lender_urm_groups %>%
+  left_join(lender_location %>% select(lei, fips), by = "lei") %>%  # attach county
+  filter(!is.na(fips)) %>%
+  group_by(fips) %>%
+  summarise(
+    n_lenders = n_distinct(lei),
+    n_aus = sum(aus_group == "AUS"),
+    n_manual_only = sum(aus_group == "manual_only"),
+    share_aus   = n_aus / n_lenders,
+    share_manual_only= n_manual_only / n_lenders,
+    .groups = "drop"
+  )
+
+pen_map_df <- counties_tri %>%
+  left_join(lender_penetration, by = "fips")
+
+
+#aus
+map_aus <- ggplot() +
+  # base counties
+  geom_sf(
+    data  = pen_map_df,
+    fill  = "#F6F0E6",
+    color = "grey85",
+    size  = 0.15
+  ) +
+  # counties with AUS lenders
+  geom_sf(
+    data  = subset(pen_map_df, !is.na(share_aus)),
+    aes(fill = share_aus),
+    color = "black",
+    size  = 0.15
+  ) +
+  # state outlines
+  geom_sf(
+    data        = states_tri,
+    fill        = NA,
+    color       = "black",
+    size        = 0.6,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_gradient(
+    low      = "#F2DCDC",   # light red
+    high     = "#B2182B",   # dark red
+    na.value = "#F6F0E6",
+    name     = "AUS\nLenders (%)",
+    labels   = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_family = "Times New Roman") +
+  theme(
+    plot.background  = element_rect(fill = "#F6F0E6", color = NA),
+    panel.background = element_rect(fill = "#F6F0E6", color = NA),
+    panel.grid       = element_blank(),
+    axis.text = element_blank()
+  )
+
+#manual
+map_manual <- ggplot() +
+  geom_sf(
+    data  = pen_map_df,
+    fill  = "#F6F0E6",
+    color = "grey85",
+    size  = 0.15
+  ) +
+  geom_sf(
+    data  = subset(pen_map_df, !is.na(share_manual_only)),
+    aes(fill = share_manual_only),
+    color = "black",
+    size  = 0.15
+  ) +
+  geom_sf(
+    data        = states_tri,
+    fill        = NA,
+    color       = "black",
+    size        = 0.6,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_gradient(
+    low      = "#D9D9D9",   # light grey
+    high     = "#4D4D4D",   # dark grey
+    na.value = "#F6F0E6",
+    name     = "Manual-only\nLenders (%)",
+    labels   = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_family = "Times New Roman") +
+  theme(
+    plot.background  = element_rect(fill = "#F6F0E6", color = NA),
+    panel.background = element_rect(fill = "#F6F0E6", color = NA),
+    panel.grid       = element_blank(),
+    axis.text = element_blank(),
+  )
+
+#join maps
+joined_map <- map_aus + map_manual +
+  plot_annotation(
+    theme = theme(
+      plot.background = element_rect(fill = "#F6F0E6", color = NA)
+    )
+  )
+  
+ 
+
+#export visualizations, assign viz as an object
+ggsave("Name", Object,
+      dpi = 600,
+       bg = "transparent")
