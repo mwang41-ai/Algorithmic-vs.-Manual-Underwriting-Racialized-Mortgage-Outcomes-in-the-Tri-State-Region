@@ -1,6 +1,7 @@
 # Algorithmic-vs.-Manual-Underwriting-Racialized-Mortgage-Outcomes-in-the-Tri-State-Region
 
 References
+
 American Community Survey. (n.d.). American Community Survey (ACS). U.S. Census Bureau. https://www.census.gov/programs-surveys/acs.html
 
 Bartlett, R., Morse, A., Stanton, R., & Wallace, N. (2022). Consumer lending discrimination in the fintech era. Journal of Financial Economics, 143(1), 30–56. https://faculty.haas.berkeley.edu/morse/research/papers/discrim.pdf
