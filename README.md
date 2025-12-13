@@ -1,4 +1,4 @@
-# Algorithmic-vs.-Manual-Underwriting-Racialized-Mortgage-Outcomes-in-the-Tri-State-Region
+# Automated-vs.-Manual-Underwriting-Racialized-Mortgage-Outcomes-in-the-Tri-State-Region
 
 References
 
